@@ -96,6 +96,16 @@ button{font-family:inherit;cursor:pointer}
 .tool-btn:hover{color:var(--txt);border-color:var(--dim)}
 .tool-btn.danger:hover{color:var(--red);border-color:rgba(248,81,73,.5)}
 .tools-note{font-size:12px;color:var(--dimmer);margin:12px 0 0;line-height:1.6}
+.probe-out{margin-top:14px;font-size:12.5px;line-height:1.75}
+.probe-row{display:flex;align-items:center;gap:9px;padding:4px 0;color:var(--dim)}
+.probe-row .dot{width:8px;height:8px;border-radius:50%;flex:0 0 8px;background:var(--dimmer)}
+.probe-row.up .dot{background:var(--green)}
+.probe-row.down .dot{background:var(--red)}
+.probe-row .why{color:var(--dimmer);font-size:11.5px}
+.probe-out input{background:var(--panel);border:1px solid var(--line);border-radius:7px;
+  padding:8px 11px;color:var(--txt);font-family:'JetBrains Mono',monospace;font-size:12px;
+  width:100%;max-width:420px;outline:none;margin-top:8px}
+.probe-out input:focus{border-color:var(--accent)}
 
 /* ================= QUESTION LIST ================= */
 .list-wrap{max-width:1120px;margin:0 auto;padding:26px 20px 70px}
@@ -392,6 +402,12 @@ ul.constraints li{font-family:'JetBrains Mono',monospace;font-size:12.5px}
         <input type="file" id="importFile" accept="application/json" hidden>
       </div>
       <p class="tools-note" id="storageNote"></p>
+
+      <div class="tools-row" style="margin-top:16px">
+        <button class="tool-btn" id="probeBtn">Check compilers</button>
+        <button class="tool-btn" id="customBtn">Compiler settings</button>
+      </div>
+      <div id="probeOut" class="probe-out"></div>
     </div>
   </div>
 </div>
@@ -4136,23 +4152,65 @@ async function callJson(prompt, maxTokens, attempts){
    never misled about which one graded her.
    ------------------------------------------------------------ */
 
-const PISTON = "https://emkc.org/api/v2/piston/execute";
-const PISTON_RUNTIMES = "https://emkc.org/api/v2/piston/runtimes";
-let engineMode = "unknown";          // unknown | piston | claude
-let pistonVersion = null;            // discovered at runtime, never assumed
-let engineRetryAt = 0;               // when to re-probe after a failure
+/* ------------------------------------------------------------
+   EXECUTION ENGINES
+
+   1. Wandbox — free public service running a real GCC. No API key,
+      and it sends Access-Control-Allow-Origin: *, so a browser on
+      any domain can call it. This is the authoritative engine.
+
+   2. A self-hosted Piston, if you set SELF_HOSTED below. Use this
+      for a whole class; the public Piston API stopped being free
+      in February 2026 and now needs an authorisation key.
+
+   3. Claude — traces execution instead of compiling. Only used when
+      neither of the above can be reached.
+
+   The engine that graded the work is always shown beside the editor.
+   ------------------------------------------------------------ */
+
+/* Several independent public compiler services. They are tried in order
+   and the first that answers is used, so one going down does not stop work. */
+const BACKENDS = [
+  { id:"wandbox", label:"GCC (Wandbox)",  run:(c,i,p)=>runWandbox(c,i,p) },
+  { id:"godbolt", label:"g++ (Godbolt)",  run:(c,i,p)=>runGodbolt(c,i,p) },
+  { id:"piston",  label:"g++ (Piston)",   run:(c,i,p)=>runPiston(c,i,p, PISTON_PUBLIC) }
+];
+
+const WANDBOX       = "https://wandbox.org/api/compile.json";
+const GODBOLT       = "https://godbolt.org/api";
+const PISTON_PUBLIC = "https://emkc.org/api/v2/piston/execute";
+
+let engineMode = "unknown";     // unknown | <backend id> | traced | none
+let engineLabel = "";
+let engineRetryAt = 0;
+let godboltCompiler = null;
+let lastEngineErrors = {};
+
+/* A self-hosted Piston can be pointed at from the UI; it wins when set. */
+function selfHostedUrl(){
+  try{ return localStorage.getItem("icp:compiler-url") || null; }catch(e){ return null; }
+}
+
+/* The traced engine only exists inside Claude, where a key is injected.
+   On a deployed site it can never work, so it must not be offered. */
+const tracedAvailable = () => !!(typeof window !== "undefined" && window.storage);
 
 function setEngineLabel(){
   const el = document.querySelector(".lang-chip");
   if (!el) return;
-  if (engineMode === "piston"){
-    el.textContent = "C++ · g++ 10.2";
-    el.title = "Compiled and run by a real g++ toolchain.";
-    el.className = "lang-chip real";
-  } else if (engineMode === "claude"){
+  if (engineMode === "traced"){
     el.textContent = "C++ · simulated";
-    el.title = "A real compiler was unreachable, so execution is being traced instead. Very close, but not authoritative.";
+    el.title = "No compiler service was reachable, so execution is being traced. Close, but not authoritative.";
     el.className = "lang-chip sim";
+  } else if (engineMode === "none"){
+    el.textContent = "C++ · no compiler";
+    el.title = "No compiler service could be reached from this browser.";
+    el.className = "lang-chip sim";
+  } else if (engineMode !== "unknown"){
+    el.textContent = "C++ · " + engineLabel;
+    el.title = "Compiled and run by a real GCC toolchain. Results are authoritative.";
+    el.className = "lang-chip real";
   } else {
     el.textContent = "C++ (GNU 17)";
     el.className = "lang-chip";
@@ -4161,63 +4219,145 @@ function setEngineLabel(){
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-/* Ask the service which C++ toolchain it actually offers, rather than
-   pinning a version that may be retired. */
-async function pistonReady(){
-  if (pistonVersion) return pistonVersion;
-  const res = await fetch(PISTON_RUNTIMES);
-  if (!res.ok) throw new Error("runtimes HTTP " + res.status);
-  const list = await res.json();
-  const cpp = list.find(r => r.language === "c++")
-           || list.find(r => (r.aliases || []).includes("cpp"));
-  if (!cpp) throw new Error("no c++ runtime available");
-  pistonVersion = cpp.version;
-  return pistonVersion;
+/* Give every network call a ceiling so a stalled service cannot hang a submit. */
+function withTimeout(promise, ms, what){
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(what + " timed out")), ms))
+  ]);
 }
 
-async function pistonOnce(code, stdin){
-  const version = await pistonReady();
-  const res = await fetch(PISTON, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      language: "c++",
-      version: version,
-      files: [{ name: "main.cpp", content: code }],
-      stdin: stdin || "",
-      compile_timeout: 10000,
-      run_timeout: 3000
-    })
-  });
-  if (!res.ok) throw new Error("piston HTTP " + res.status);
-  return res.json();
-}
-
-/* Real compiler path. Returns the same shape as the fallback. */
-async function runCppPiston(code, inputs, onProgress){
-  const out = { compileError: null, runs: [] };
+/* ---------------- Wandbox ---------------- */
+async function runWandbox(code, inputs, onProgress){
+  const out = { compileError:null, runs:[] };
   for (let i = 0; i < inputs.length; i++){
-    if (onProgress) onProgress(i + 1, inputs.length);
-    if (i) await wait(260);                       // stay inside the public rate limit
-    const r = await pistonOnce(code, inputs[i]);
+    if (onProgress) onProgress(i+1, inputs.length);
+    if (i) await wait(200);
+    const res = await withTimeout(fetch(WANDBOX, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ code, compiler:"gcc-head", stdin: inputs[i] || "",
+                             options:"warning", "compiler-option-raw":"-std=c++17", save:false })
+    }), 25000, "Wandbox");
+    if (!res.ok) throw new Error("Wandbox HTTP " + res.status);
+    const r = await res.json();
+    if (/error:/i.test(r.compiler_error || "")){
+      out.compileError = (r.compiler_error || "Compilation failed").trim();
+      out.runs = []; return out;
+    }
+    let error = null;
+    if (r.signal) error = r.signal === "Killed" ? "Time Limit Exceeded" : "Terminated: " + r.signal;
+    else if (r.program_error && r.program_error.trim()) error = r.program_error.trim();
+    out.runs.push({ output: r.program_output || "", error });
+  }
+  return out;
+}
 
+/* ---------------- Godbolt (Compiler Explorer) ---------------- */
+async function godboltPickCompiler(){
+  if (godboltCompiler) return godboltCompiler;
+  const res = await withTimeout(fetch(GODBOLT + "/compilers/c++?fields=id,name",
+    { headers:{ "Accept":"application/json" } }), 15000, "Godbolt");
+  if (!res.ok) throw new Error("Godbolt HTTP " + res.status);
+  const list = await res.json();
+  const gcc = list.filter(c => /^g\d+$/.test(c.id)).sort((a,b) =>
+    parseInt(b.id.slice(1),10) - parseInt(a.id.slice(1),10));
+  if (!gcc.length) throw new Error("no GCC available on Godbolt");
+  godboltCompiler = gcc[0].id;
+  return godboltCompiler;
+}
+
+async function runGodbolt(code, inputs, onProgress){
+  const comp = await godboltPickCompiler();
+  const out = { compileError:null, runs:[] };
+  for (let i = 0; i < inputs.length; i++){
+    if (onProgress) onProgress(i+1, inputs.length);
+    if (i) await wait(200);
+    const res = await withTimeout(fetch(GODBOLT + "/compiler/" + comp + "/compile", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json", "Accept":"application/json" },
+      body: JSON.stringify({
+        source: code, lang:"c++", allowStoreCodeDebug:false,
+        options:{
+          userArguments:"-O2 -std=c++17",
+          executeParameters:{ args:[], stdin: inputs[i] || "" },
+          compilerOptions:{ executorRequest:true },
+          filters:{ execute:true }, tools:[], libraries:[]
+        }
+      })
+    }), 30000, "Godbolt");
+    if (!res.ok) throw new Error("Godbolt HTTP " + res.status);
+    const r = await res.json();
+    const join = a => (a || []).map(x => x.text).join("\n");
+
+    if (r.buildResult && r.buildResult.code !== 0){
+      out.compileError = (join(r.buildResult.stderr) || "Compilation failed").trim();
+      out.runs = []; return out;
+    }
+    let error = null;
+    if (r.code !== 0) error = (join(r.stderr) || "Runtime error").trim();
+    else if (r.timedOut) error = "Time Limit Exceeded";
+    out.runs.push({ output: join(r.stdout), error });
+  }
+  return out;
+}
+
+/* ---------------- Piston (public or self-hosted) ---------------- */
+async function runPiston(code, inputs, onProgress, endpoint){
+  const out = { compileError:null, runs:[] };
+  for (let i = 0; i < inputs.length; i++){
+    if (onProgress) onProgress(i+1, inputs.length);
+    if (i) await wait(250);
+    const res = await withTimeout(fetch(endpoint, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({
+        language:"c++", version:"*",
+        files:[{ name:"main.cpp", content: code }],
+        stdin: inputs[i] || "", compile_timeout:10000, run_timeout:3000
+      })
+    }), 30000, "Piston");
+    if (!res.ok) throw new Error("Piston HTTP " + res.status);
+    const r = await res.json();
     if (r.compile && r.compile.code !== 0){
-      out.compileError = (r.compile.stderr || r.compile.output || "Compilation failed").trim();
-      out.runs = [];
-      return out;
+      out.compileError = (r.compile.stderr || "Compilation failed").trim();
+      out.runs = []; return out;
     }
     const run = r.run || {};
     let error = null;
     if (run.signal === "SIGKILL") error = "Time Limit Exceeded";
-    else if (run.code !== 0) error = (run.stderr || "Runtime error").trim() || "Runtime error";
-    else if (run.stderr && run.stderr.trim()) error = run.stderr.trim();
-
+    else if (run.code !== 0) error = (run.stderr || "Runtime error").trim();
     out.runs.push({ output: run.stdout || "", error });
   }
   return out;
 }
 
-const BATCH = 4;   // inputs per API call, keeps each response well inside the token budget
+/* ---------------- diagnostics ---------------- */
+const PROBE = '#include <iostream>\nint main(){int n;std::cin>>n;std::cout<<n*2;return 0;}';
+
+async function probeBackends(){
+  const results = [];
+  const self = selfHostedUrl();
+  const list = self
+    ? [{ id:"self", label:"self-hosted Piston", run:(c,i)=>runPiston(c,i,null,self) }, ...BACKENDS]
+    : BACKENDS.slice();
+
+  for (const b of list){
+    const t0 = Date.now();
+    try{
+      const r = await b.run(PROBE, ["21"], null);
+      const got = (r.runs[0] && r.runs[0].output || "").trim();
+      results.push(got === "42"
+        ? { id:b.id, label:b.label, ok:true, ms:Date.now()-t0 }
+        : { id:b.id, label:b.label, ok:false, why:"unexpected output: " + JSON.stringify(got) });
+    }catch(e){
+      results.push({ id:b.id, label:b.label, ok:false, why:e.message });
+    }
+  }
+  return results;
+}
+
+const BATCH = 4;   // inputs per traced-engine call, keeps each response inside the token budget
 
 /* Compile + execute the program once per input. Returns
    { compileError, runs:[{output,error}] } with runs.length === inputs.length. */
@@ -4225,22 +4365,48 @@ async function runCpp(code, inputs, onProgress){
   if (typeof navigator !== "undefined" && navigator.onLine === false)
     throw new Error("you appear to be offline");
 
-  /* Prefer the real compiler. If it failed recently, wait a few minutes
-     before paying the cost of probing it again. */
-  const mayTryReal = engineMode !== "claude" || Date.now() > engineRetryAt;
-  if (mayTryReal){
-    try{
-      const real = await runCppPiston(code, inputs, onProgress);
-      if (engineMode !== "piston"){ engineMode = "piston"; setEngineLabel(); }
-      return real;
-    }catch(e){
-      pistonVersion = null;
-      engineRetryAt = Date.now() + 5 * 60 * 1000;
-      if (engineMode !== "claude"){ engineMode = "claude"; setEngineLabel(); }
-      /* fall through to the traced engine below */
+  const self = selfHostedUrl();
+  const chain = self
+    ? [{ id:"self", label:"self-hosted", run:(c,i,p)=>runPiston(c,i,p,self) }, ...BACKENDS]
+    : BACKENDS.slice();
+
+  /* Stick with whatever worked last time; only rescan when it fails. */
+  if (engineMode !== "unknown" && engineMode !== "traced" && engineMode !== "none"){
+    const current = chain.find(b => b.id === engineMode);
+    if (current){
+      try{ return await current.run(code, inputs, onProgress); }
+      catch(e){ lastEngineErrors[current.id] = e.message; }
     }
   }
-  return runCppTraced(code, inputs, onProgress);
+
+  const mayRescan = engineMode === "unknown" || Date.now() > engineRetryAt ||
+                    (engineMode !== "traced" && engineMode !== "none");
+  if (mayRescan){
+    for (const b of chain){
+      if (b.id === engineMode) continue;              // just tried it
+      try{
+        const r = await b.run(code, inputs, onProgress);
+        engineMode = b.id; engineLabel = b.label; setEngineLabel();
+        delete lastEngineErrors[b.id];
+        return r;
+      }catch(e){ lastEngineErrors[b.id] = e.message; }
+    }
+  }
+
+  /* Every real compiler failed. Trace it only where that can actually work. */
+  if (tracedAvailable()){
+    engineMode = "traced"; setEngineLabel();
+    engineRetryAt = Date.now() + 3 * 60 * 1000;
+    return runCppTraced(code, inputs, onProgress);
+  }
+
+  engineMode = "none"; setEngineLabel();
+  engineRetryAt = Date.now() + 60 * 1000;
+  const detail = Object.entries(lastEngineErrors)
+    .map(([k,v]) => "• " + k + ": " + v).join("\n");
+  const err = new Error("no compiler service could be reached");
+  err.detail = detail;
+  throw err;
 }
 
 async function runCppTraced(code, inputs, onProgress){
@@ -4523,7 +4689,8 @@ byId("runBtn").onclick = async () => {
       } else errPane.innerHTML = '<span class="muted">No errors.</span>';
     }
   }catch(e){
-    out.innerHTML = '<span class="err">Could not reach the compiler ('+esc(e.message)+'). Check your connection and try again.</span>';
+    out.innerHTML = '<span class="err">Could not reach the compiler ('+esc(e.message)+').\n\n'+
+      'This is usually temporary — wait a moment and press Run again.</span>';
   }
   btn.disabled = false;
 };
@@ -4586,10 +4753,26 @@ byId("submitBtn").onclick = async () => {
     }
   }catch(e){
     pane.innerHTML = '<div class="verdict warn">Could not run</div><span class="muted">'+
-      esc(e.message)+'. Check your connection and try again.</span>';
+      esc(e.message)+'.<br><br>The compiler service could not be reached. This is usually '+
+      'temporary — wait a moment and submit again.</span>';
   }
   btn.disabled = false;
 };
+
+function compilerErrorHtml(e){
+  const detail = e && e.detail ? e.detail : "";
+  return '<div class="verdict warn">No compiler available</div>' +
+    '<div class="diag">Every compiler service was unreachable from this browser. ' +
+    'This is usually a network block, an ad-blocker, or all three services being down at once.' +
+    (detail ? '<br><br><b>What each one said:</b><br>' + esc(detail).replace(/\n/g,"<br>") : '') +
+    '<br><br><b>Things to try:</b><br>' +
+    '• Disable any ad-blocker or shield for this site and reload<br>' +
+    '• Try a different browser or network<br>' +
+    '• Use <b>Check compilers</b> on the home screen to test each service<br>' +
+    '• For a class, point the app at your own compiler (home screen → Compiler settings)</div>' +
+    '<div class="muted" style="margin-top:10px">Everything else — the questions, the expected-output ' +
+    'generator, and all of WebDev101 — works without a compiler.</div>';
+}
 
 function grade(q, r){
   let passed = 0, html = "";
@@ -4948,6 +5131,39 @@ function wireTools(){
       file.value = "";
     };
   }
+
+  const probeBtn = byId("probeBtn"), probeOut = byId("probeOut");
+  if (probeBtn) probeBtn.onclick = async () => {
+    probeBtn.disabled = true;
+    probeOut.innerHTML = '<span class="muted"><span class="spinner"></span> Testing each compiler service…</span>';
+    const rows = await probeBackends();
+    const anyUp = rows.some(r => r.ok);
+    probeOut.innerHTML = rows.map(r =>
+      `<div class="probe-row ${r.ok?'up':'down'}"><span class="dot"></span>` +
+      `<span>${r.label}</span>` +
+      `<span class="why">${r.ok ? r.ms + "ms — working" : esc(r.why)}</span></div>`).join("") +
+      (anyUp ? '<div class="tools-note">At least one compiler works, so Run and Submit will function.</div>'
+             : '<div class="tools-note">None responded. Try disabling an ad-blocker for this site, ' +
+               'or switching browser or network. You can also point the app at your own compiler below.</div>');
+    probeBtn.disabled = false;
+  };
+
+  const customBtn = byId("customBtn");
+  if (customBtn) customBtn.onclick = () => {
+    const current = selfHostedUrl() || "";
+    const url = prompt(
+      "Your own Piston compiler endpoint (leave blank to use the public services):\n\n" +
+      "Run one with:\n  docker run -d -p 2000:2000 --privileged ghcr.io/engineer-man/piston\n" +
+      "  docker exec piston cli/index.js ppman install c++\n\n" +
+      "Then enter:  http://your-server:2000/api/v2/execute", current);
+    if (url === null) return;
+    try{
+      if (url.trim()) localStorage.setItem("icp:compiler-url", url.trim());
+      else localStorage.removeItem("icp:compiler-url");
+      engineMode = "unknown"; engineLabel = ""; setEngineLabel();
+      toast(url.trim() ? "Compiler set — press Check compilers to test it" : "Back to the public compilers", true);
+    }catch(e){ toast("Could not save that setting"); }
+  };
 
   const resetBtn = byId("resetAllBtn");
   if (resetBtn) resetBtn.onclick = async () => {
